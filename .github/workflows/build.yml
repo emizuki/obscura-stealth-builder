@@ -1,14 +1,18 @@
 name: Build Obscura (stealth)
 
-# Thin builder: checks upstream for the newest release, checks out its source
-# at that tag, flips the cargo feature set to include `stealth`, then builds a
-# multi-arch image and pushes it to this repo's GHCR namespace.
-# Nothing is forked, so there is no upstream drift to reconcile.
+# Rebuilds h4ckf0r0day/obscura with the `stealth` cargo feature and pushes a
+# multi-arch image to this repo's GHCR namespace. Nothing is forked: each run
+# checks out upstream's source at its latest release tag and patches it.
+#
+# Each architecture is built on a NATIVE runner (amd64 on ubuntu-latest, arm64
+# on ubuntu-24.04-arm) rather than through QEMU emulation — building V8 +
+# BoringSSL under emulation took 2h+ and blew the layer cache. The two
+# per-arch images are pushed by digest, then stitched into one manifest list.
 
 on:
   schedule:
     - cron: '0 6 * * *'        # daily 06:00 UTC — auto-detect new upstream releases
-  workflow_dispatch:            # manual "Run workflow" button
+  workflow_dispatch:
     inputs:
       tag:
         description: 'Upstream tag to build (blank = latest release)'
@@ -26,8 +30,16 @@ env:
   UPSTREAM: h4ckf0r0day/obscura
 
 jobs:
-  build:
+  # ---------------------------------------------------------------------------
+  # Resolve which upstream tag to build and whether it already exists in GHCR.
+  # ---------------------------------------------------------------------------
+  prepare:
     runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.gate.outputs.build }}
+      tag: ${{ steps.up.outputs.tag }}
+      version: ${{ steps.up.outputs.version }}
+      image: ${{ steps.up.outputs.image }}
     steps:
       - name: Resolve upstream tag
         id: up
@@ -49,93 +61,155 @@ jobs:
             fi
           fi
           [ -n "$TAG" ] || { echo "Could not resolve an upstream tag"; exit 1; }
-          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
-          echo "version=${TAG#v}"    >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"         >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
           IMAGE="ghcr.io/$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')/obscura"
-          echo "image=$IMAGE"        >> "$GITHUB_OUTPUT"
+          echo "image=$IMAGE"     >> "$GITHUB_OUTPUT"
           echo "Upstream tag: $TAG  ->  $IMAGE:${TAG#v}"
 
       - name: Decide whether to build
         id: gate
+        env:
+          TOKEN: ${{ github.token }}
+          ACTOR: ${{ github.actor }}
+          FORCE: ${{ github.event.inputs.force }}
+          REF: ${{ steps.up.outputs.image }}:${{ steps.up.outputs.version }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+          if [ "$FORCE" = "true" ]; then
             echo "build=true" >> "$GITHUB_OUTPUT"; echo "forced rebuild"; exit 0
           fi
-          echo "${{ github.token }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
-          if docker manifest inspect "${{ steps.up.outputs.image }}:${{ steps.up.outputs.version }}" >/dev/null 2>&1; then
+          echo "$TOKEN" | docker login ghcr.io -u "$ACTOR" --password-stdin
+          if docker manifest inspect "$REF" >/dev/null 2>&1; then
             echo "build=false" >> "$GITHUB_OUTPUT"
-            echo "Version ${{ steps.up.outputs.version }} already in GHCR — nothing to do."
+            echo "$REF already in GHCR — nothing to do."
           else
             echo "build=true" >> "$GITHUB_OUTPUT"
-            echo "New version ${{ steps.up.outputs.version }} — building."
+            echo "$REF not found — building."
           fi
 
+  # ---------------------------------------------------------------------------
+  # Build each arch natively and push it by digest (no tag yet).
+  # ---------------------------------------------------------------------------
+  build:
+    needs: prepare
+    if: needs.prepare.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
       - name: Checkout upstream at tag
-        if: steps.gate.outputs.build == 'true'
         uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM }}
-          ref: ${{ steps.up.outputs.tag }}
+          ref: ${{ needs.prepare.outputs.tag }}
           persist-credentials: false
 
       - name: Enable the stealth feature
-        if: steps.gate.outputs.build == 'true'
         run: |
           set -euo pipefail
 
           # 1) Flip the cargo feature set: `render` -> `render,stealth`.
           sed -i 's/--features render /--features render,stealth /g' Dockerfile
 
-          # 2) The stealth feature pulls in wreq -> boring-sys, which compiles
-          #    BoringSSL. That needs git + a C/C++ + LLVM toolchain that the
-          #    upstream slim builder image does not ship (the default `render`
-          #    build never needs them). Upstream's release CI gets cmake/clang/
-          #    libclang-dev/llvm-dev; on the slim image we ALSO need git, a real
-          #    C/C++ compiler + libc headers (build-essential — CMake's
-          #    FindThreads/pthread probe fails without it) and pkg-config, which
-          #    GitHub's ubuntu runners already ship. Append them to the
-          #    builder-stage apt install list.
+          # 2) stealth pulls in wreq -> boring-sys, which compiles BoringSSL and
+          #    needs a git + C/C++ + LLVM toolchain the upstream slim builder
+          #    image does not ship. Append what upstream's release CI installs
+          #    (cmake clang libclang-dev llvm-dev) plus git, build-essential
+          #    (CMake's FindThreads probe fails without a real cc + libc headers)
+          #    and pkg-config, to the builder-stage apt install list.
           sed -i -E 's#^([[:space:]]*)make \\$#\1make \\\n\1git \\\n\1build-essential \\\n\1pkg-config \\\n\1cmake \\\n\1clang \\\n\1libclang-dev \\\n\1llvm-dev \\#' Dockerfile
 
-          echo "----- patched cargo build lines -----"
-          grep -n 'cargo build' Dockerfile
-          echo "----- builder apt packages -----"
-          grep -nE 'git|cmake|clang|llvm' Dockerfile
+          echo "----- patched cargo build lines -----"; grep -n 'cargo build' Dockerfile
+          echo "----- builder apt packages -----";      grep -nE 'git|cmake|clang|llvm' Dockerfile
 
-          # Fail loudly if either patch didn't take (e.g. upstream restructured).
           grep -q -- '--features render,stealth' Dockerfile \
             || { echo "::error::stealth feature patch failed — Dockerfile build line changed"; exit 1; }
           grep -q -- 'llvm-dev' Dockerfile \
             || { echo "::error::apt deps patch failed — Dockerfile install block changed"; exit 1; }
 
-      - name: Set up QEMU
-        if: steps.gate.outputs.build == 'true'
-        uses: docker/setup-qemu-action@v4
-
       - name: Set up Docker Buildx
-        if: steps.gate.outputs.build == 'true'
         uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
-        if: steps.gate.outputs.build == 'true'
         uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ github.token }}
 
-      - name: Build and push
-        if: steps.gate.outputs.build == 'true'
+      - name: Build and push by digest
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: .
-          push: true
+          platforms: ${{ matrix.platform }}
           build-args: |
-            OBSCURA_VERSION=${{ steps.up.outputs.version }}
-          tags: |
-            ${{ steps.up.outputs.image }}:${{ steps.up.outputs.version }}
-            ${{ steps.up.outputs.image }}:latest
-          platforms: linux/amd64,linux/arm64
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+            OBSCURA_VERSION=${{ needs.prepare.outputs.version }}
+          outputs: type=image,name=${{ needs.prepare.outputs.image }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+
+      - name: Export digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/digests
+          touch "/tmp/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # Stitch the per-arch digests into one multi-arch manifest and tag it.
+  # ---------------------------------------------------------------------------
+  merge:
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create and push manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ needs.prepare.outputs.image }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          set -euo pipefail
+          refs=""
+          for d in *; do refs="$refs ${IMAGE}@sha256:${d}"; done
+          echo "Combining:$refs"
+          docker buildx imagetools create \
+            -t "${IMAGE}:${VERSION}" \
+            -t "${IMAGE}:latest" \
+            $refs
+          docker buildx imagetools inspect "${IMAGE}:${VERSION}"

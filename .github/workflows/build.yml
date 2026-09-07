@@ -73,7 +73,7 @@ jobs:
 
       - name: Checkout upstream at tag
         if: steps.gate.outputs.build == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           repository: ${{ env.UPSTREAM }}
           ref: ${{ steps.up.outputs.tag }}
@@ -90,11 +90,13 @@ jobs:
           # 2) The stealth feature pulls in wreq -> boring-sys, which compiles
           #    BoringSSL. That needs git + a C/C++ + LLVM toolchain that the
           #    upstream slim builder image does not ship (the default `render`
-          #    build never needs them). Add exactly what upstream's own release
-          #    CI installs for stealth (cmake clang libclang-dev llvm-dev),
-          #    plus git (free on GH runners, absent in the slim image), by
-          #    appending them to the builder-stage apt install list.
-          sed -i -E 's#^([[:space:]]*)make \\$#\1make \\\n\1git \\\n\1cmake \\\n\1clang \\\n\1libclang-dev \\\n\1llvm-dev \\#' Dockerfile
+          #    build never needs them). Upstream's release CI gets cmake/clang/
+          #    libclang-dev/llvm-dev; on the slim image we ALSO need git, a real
+          #    C/C++ compiler + libc headers (build-essential — CMake's
+          #    FindThreads/pthread probe fails without it) and pkg-config, which
+          #    GitHub's ubuntu runners already ship. Append them to the
+          #    builder-stage apt install list.
+          sed -i -E 's#^([[:space:]]*)make \\$#\1make \\\n\1git \\\n\1build-essential \\\n\1pkg-config \\\n\1cmake \\\n\1clang \\\n\1libclang-dev \\\n\1llvm-dev \\#' Dockerfile
 
           echo "----- patched cargo build lines -----"
           grep -n 'cargo build' Dockerfile
@@ -109,15 +111,15 @@ jobs:
 
       - name: Set up QEMU
         if: steps.gate.outputs.build == 'true'
-        uses: docker/setup-qemu-action@v3
+        uses: docker/setup-qemu-action@v4
 
       - name: Set up Docker Buildx
         if: steps.gate.outputs.build == 'true'
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Login to GHCR
         if: steps.gate.outputs.build == 'true'
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -125,7 +127,7 @@ jobs:
 
       - name: Build and push
         if: steps.gate.outputs.build == 'true'
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           push: true

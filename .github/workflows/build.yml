@@ -83,13 +83,29 @@ jobs:
         if: steps.gate.outputs.build == 'true'
         run: |
           set -euo pipefail
-          # Upstream Dockerfile builds with `--features render`; add stealth.
+
+          # 1) Flip the cargo feature set: `render` -> `render,stealth`.
           sed -i 's/--features render /--features render,stealth /g' Dockerfile
+
+          # 2) The stealth feature pulls in wreq -> boring-sys, which compiles
+          #    BoringSSL. That needs git + a C/C++ + LLVM toolchain that the
+          #    upstream slim builder image does not ship (the default `render`
+          #    build never needs them). Add exactly what upstream's own release
+          #    CI installs for stealth (cmake clang libclang-dev llvm-dev),
+          #    plus git (free on GH runners, absent in the slim image), by
+          #    appending them to the builder-stage apt install list.
+          sed -i -E 's#^([[:space:]]*)make \\$#\1make \\\n\1git \\\n\1cmake \\\n\1clang \\\n\1libclang-dev \\\n\1llvm-dev \\#' Dockerfile
+
           echo "----- patched cargo build lines -----"
           grep -n 'cargo build' Dockerfile
-          # Fail loudly if the patch didn't take (e.g. upstream restructured it).
+          echo "----- builder apt packages -----"
+          grep -nE 'git|cmake|clang|llvm' Dockerfile
+
+          # Fail loudly if either patch didn't take (e.g. upstream restructured).
           grep -q -- '--features render,stealth' Dockerfile \
-            || { echo "::error::Could not enable stealth — Dockerfile layout changed"; exit 1; }
+            || { echo "::error::stealth feature patch failed — Dockerfile build line changed"; exit 1; }
+          grep -q -- 'llvm-dev' Dockerfile \
+            || { echo "::error::apt deps patch failed — Dockerfile install block changed"; exit 1; }
 
       - name: Set up QEMU
         if: steps.gate.outputs.build == 'true'

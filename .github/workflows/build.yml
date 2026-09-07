@@ -1,0 +1,123 @@
+name: Build Obscura (stealth)
+
+# Thin builder: checks upstream for the newest release, checks out its source
+# at that tag, flips the cargo feature set to include `stealth`, then builds a
+# multi-arch image and pushes it to this repo's GHCR namespace.
+# Nothing is forked, so there is no upstream drift to reconcile.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'        # daily 06:00 UTC — auto-detect new upstream releases
+  workflow_dispatch:            # manual "Run workflow" button
+    inputs:
+      tag:
+        description: 'Upstream tag to build (blank = latest release)'
+        required: false
+      force:
+        description: 'Rebuild even if this version already exists in GHCR'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM: h4ckf0r0day/obscura
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve upstream tag
+        id: up
+        env:
+          GH_TOKEN: ${{ github.token }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          OWNER: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          IN="$INPUT_TAG"
+          if [ -n "$IN" ]; then
+            TAG="$IN"
+          else
+            # Prefer the published "latest release"; fall back to highest tag.
+            TAG="$(gh api "repos/${UPSTREAM}/releases/latest" --jq .tag_name 2>/dev/null || true)"
+            if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+              TAG="$(git ls-remote --tags --refs "https://github.com/${UPSTREAM}" \
+                     | awk -F/ '{print $NF}' | sort -V | tail -1)"
+            fi
+          fi
+          [ -n "$TAG" ] || { echo "Could not resolve an upstream tag"; exit 1; }
+          echo "tag=$TAG"            >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}"    >> "$GITHUB_OUTPUT"
+          IMAGE="ghcr.io/$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')/obscura"
+          echo "image=$IMAGE"        >> "$GITHUB_OUTPUT"
+          echo "Upstream tag: $TAG  ->  $IMAGE:${TAG#v}"
+
+      - name: Decide whether to build
+        id: gate
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.force }}" = "true" ]; then
+            echo "build=true" >> "$GITHUB_OUTPUT"; echo "forced rebuild"; exit 0
+          fi
+          echo "${{ github.token }}" | docker login ghcr.io -u '${{ github.actor }}' --password-stdin
+          if docker manifest inspect "${{ steps.up.outputs.image }}:${{ steps.up.outputs.version }}" >/dev/null 2>&1; then
+            echo "build=false" >> "$GITHUB_OUTPUT"
+            echo "Version ${{ steps.up.outputs.version }} already in GHCR — nothing to do."
+          else
+            echo "build=true" >> "$GITHUB_OUTPUT"
+            echo "New version ${{ steps.up.outputs.version }} — building."
+          fi
+
+      - name: Checkout upstream at tag
+        if: steps.gate.outputs.build == 'true'
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ steps.up.outputs.tag }}
+          persist-credentials: false
+
+      - name: Enable the stealth feature
+        if: steps.gate.outputs.build == 'true'
+        run: |
+          set -euo pipefail
+          # Upstream Dockerfile builds with `--features render`; add stealth.
+          sed -i 's/--features render /--features render,stealth /g' Dockerfile
+          echo "----- patched cargo build lines -----"
+          grep -n 'cargo build' Dockerfile
+          # Fail loudly if the patch didn't take (e.g. upstream restructured it).
+          grep -q -- '--features render,stealth' Dockerfile \
+            || { echo "::error::Could not enable stealth — Dockerfile layout changed"; exit 1; }
+
+      - name: Set up QEMU
+        if: steps.gate.outputs.build == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.gate.outputs.build == 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: steps.gate.outputs.build == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push
+        if: steps.gate.outputs.build == 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          build-args: |
+            OBSCURA_VERSION=${{ steps.up.outputs.version }}
+          tags: |
+            ${{ steps.up.outputs.image }}:${{ steps.up.outputs.version }}
+            ${{ steps.up.outputs.image }}:latest
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
